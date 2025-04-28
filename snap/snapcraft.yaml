@@ -1,0 +1,287 @@
+name: immich
+base: core22
+adopt-info: immich
+summary: High performance self-hosted photo and video management solution.
+description: |
+  immich is intended to be a high performance self-hosted alternative to larger
+  cloud offerings for similar services. The features are numerous. For more
+  information on immich in general, see the upstream documentation:
+  https://immich.app/docs/overview/introduction
+
+  This particular snap is unaffiliated with the official upstream and is
+  intended for use on Ubuntu Core. The primary focus is on factoring out as much
+  as the infrastructure to other snaps as possible. This means:
+
+  1) using a separate http server snap
+  2) using a separate data store snap
+  3) using a separate database snap
+
+  The canonical implementation is using caddy-dilyn, valkey-dilyn, and
+  postgresql-dilyn to expose all the underlying infrastructure. Please refer to
+  those snaps for more information on their usage.
+
+  Essentially, this snap should deploy and function out-of-the-box when using
+  those snaps. Immich should expose itself on some port (2283 by default) to all
+  devices on a LAN (or on the broader internet, if setup as such), and it should
+  manage its own database as configured using the postgresql snap.
+grade: devel
+confinement: strict
+
+package-repositories:
+  - type: apt
+    url: https://repo.jellyfin.org/ubuntu
+    suites: [jammy]
+    components: [main]
+    key-id: 4918AABC486CA052358D778D49023CD01DE21A7B
+    architectures: [$CRAFT_ARCH_BUILD_FOR]
+
+# postgres hates to run with root permissions and this is a workaround to allow
+# a snap to drop privileges to some non-root user.
+# Requires setpriv and some sort of command chain script to handle permission
+# dropping. See: https://snapcraft.io/docs/system-usernames
+system-usernames:
+  snap_daemon: shared
+
+assumes:
+  - snapd2.68
+
+plugs:
+  postgresql:
+    interface: content
+    content: bins
+    target: $SNAP/postgresql
+
+hooks:
+  connect-plug-postgresql:
+    plugs: &_pgplugs [network, network-bind, postgresql]
+    environment: &_pgenv
+      PGDATA:     ${SNAP_COMMON}/postgresql/database
+      PGPASSFILE: ${SNAP_COMMON}/postgresql/.pgpass
+      PATH: >
+        ${SNAP}/postgresql/usr/lib/postgresql/14/bin:
+        $PATH
+      LD_LIBRARY_PATH: >
+        ${SNAP}/postgresql/usr/lib/${CRAFT_ARCH_TRIPLET_BUILD_FOR}:
+        $LD_LIBRARY_PATH
+
+apps:
+  server:
+    command: usr/bin/immich-server.sh
+    daemon: simple
+    install-mode: disable
+    plugs: [network, network-bind, postgresql, removable-media]
+    # Documentation for all the supported env variables available at https://immich.app/docs/install/environment-variables
+    # Any user-configurable environment variables can be set via snap
+    # configuration and will be set to expected defaults in immich-server.sh
+    environment:
+      IMMICH_BUILD_DATA: ${SNAP}/usr/lib/immich/build
+      PERL5LIB: $PERL5LIB:${SNAP}/usr/share/perl5:$SNAP/usr/share/perl
+      PATH: ${SNAP}/postgresql/usr/lib/postgresql/14/bin:$PATH
+      LD_LIBRARY_PATH: ${SNAP}/postgresql/usr/lib/${CRAFT_ARCH_TRIPLET_BUILD_FOR}:$LD_LIBRARY_PATH
+
+  postgresql:
+    command: usr/bin/postgresql.sh start
+    daemon: simple
+    install-mode: disable
+    stop-command: usr/bin/postgresql.sh stop
+    reload-command: usr/bin/postgresql.sh reload
+    plugs: *_pgplugs
+    environment: *_pgenv
+
+  createdb:
+    command: usr/bin/postgresql.sh createdb
+    daemon: simple
+    install-mode: disable
+    plugs: *_pgplugs
+    environment: *_pgenv
+
+  # ml:
+  #   command: usr/bin/machine-learning.sh
+  #   daemon: simple
+  #   install-mode: disable
+  #   environment:
+  #     PYTHONUNBUFFERED:        1
+  #     PYTHONDONTWRITEBYTECODE: 1
+  #     NODE_ENV:           production
+  #     VIRTUAL_ENV:        "$SNAP/opt/immich-machine-learning/venv"
+  #     IMMICH_BUILD_DATA:  "$SNAP/usr/lib/immich/build"
+  #     TRANSFORMERS_CACHE: /tmp/cache
+
+parts:
+  scripts:
+    source: src/
+    plugin: dump
+    organize:
+      '*': usr/bin/
+
+  immich:
+    plugin: nil
+    source: https://github.com/immich-app/immich
+    source-depth: 1
+    source-type: git
+    source-tag: v1.131.3
+    build-snaps: [node/20/stable]
+    stage-snaps: [node/20/stable]
+    build-packages:
+      - libfftw3-dev
+      - libopenexr-dev
+      - libgsf-1-dev
+      - libglib2.0-dev
+      - liborc-dev
+      - libopenslide-dev
+      - libmatio-dev
+      - libwebp-dev
+      - libjpeg-turbo8-dev
+      - libexpat1-dev
+      - libexif-dev
+      - libtiff5-dev
+      - libcfitsio-dev
+      - libpoppler-glib-dev
+      - librsvg2-dev
+      - libpango1.0-dev
+      - libopenjp2-7-dev
+      - libimagequant-dev
+      - liblcms2-dev
+      - libvips-dev
+    stage-packages: [jellyfin-ffmpeg7, libvips42, perl]
+    override-pull: |
+      craftctl default
+
+      craftctl set version=$(git describe --tags)
+    override-build: |
+      install -Dm644 LICENSE \
+        "${CRAFT_PART_INSTALL}/usr/lib/immich/app/LICENSE"
+
+      mkdir -p "${CRAFT_PART_INSTALL}/usr/bin"              \
+               "${CRAFT_PART_INSTALL}/usr/lib/immich/app"   \
+               "${CRAFT_PART_INSTALL}/usr/lib/immich/cli"   \
+               "${CRAFT_PART_INSTALL}/usr/lib/immich/build" \
+               "${CRAFT_PART_INSTALL}/opt/immich-machine-learning"
+
+      # Server
+      (
+        tmpdir=$(mktemp -d)
+
+        cd server/
+
+        npm install --save node-addon-api node-gyp sharp
+
+        npm ci
+        npm run build
+
+        cp -rf node_modules/@img                 \
+               node_modules/exiftool-vendored.pl \
+               "${tmpdir}"
+
+        rm -rf "${tmpdir}/@img/sharp-libvips"* \
+               "${tmpdir}/@img/sharp-linuxmusl-x64"
+
+        npm prune --omit=dev --omit=optional
+
+        mkdir -p node_modules/@img node_modules/exiftool-vendored.pl
+
+        mv -f "${tmpdir}/@img/"*                 node_modules/@img
+        mv -f "${tmpdir}/exiftool-vendored.pl/"* node_modules/exiftool-vendored.pl
+
+        rm -rf "${tmpdir}"
+
+        cp -rf bin               \
+               dist              \
+               resources         \
+               node_modules      \
+               package.json      \
+               package-lock.json \
+               "${CRAFT_PART_INSTALL}/usr/lib/immich/app"
+      )
+
+      # Dependencies for Frontend
+      (
+        cd open-api/typescript-sdk/
+        npm ci
+        npm run build
+      )
+
+      # Frontend
+      (
+        cd web/
+        npm ci
+        npm run build
+        npm prune --omit=dev
+
+        cp -rf build  "${CRAFT_PART_INSTALL}/usr/lib/immich/build/www"
+        cp -rf static "${CRAFT_PART_INSTALL}/usr/lib/immich/build/www/static"
+
+      )
+
+      # CLI
+      (
+        cd cli/
+        npm ci
+        npm run build
+
+        cp -rf dist         \
+               LICENSE      \
+               node_modules \
+               "${CRAFT_PART_INSTALL}/usr/lib/immich/cli"
+
+        # Expose immich as a command
+        chmod +x "${CRAFT_PART_INSTALL}/usr/lib/immich/cli/dist/index.js"
+        ln -sf ../lib/immich/cli/dist/index.js "${CRAFT_PART_INSTALL}/usr/bin/immich"
+      )
+
+      # Machine learning
+      # --extra cuda --extra rocm --extra openvino
+      # To be dealt with later
+      # (
+      #   cd machine-learning
+
+      #   sed -i 's|cache_folder: str = ".*"|cache_folder: str = "/var/lib/immich/.cache"|' app/config.py
+      #   uv sync         \
+      #     --frozen      \
+      #     --no-dev      \
+      #     --no-editable \
+      #     --extra cpu   \
+      #     --python 3.12 \
+      #     --no-managed-python
+
+      #     find .venv -type f -name "*.py[co]"    -exec rm -f {} \;
+      #     find .venv -type d -name "__pycache__" -exec rm -f {} \;
+
+
+      #   cp -rf "machine-learning/.venv" \
+      #          "${CRAFT_PART_INSTALL}/opt/immich-machine-learning/venv"
+      #   cp -rf "machine-learning/app"   \
+      #          "machine-learning/ann"   \
+      #          "${CRAFT_PART_INSTALL}/opt/immich-machine-learning"
+
+      #   install -Dm644 machine-learning/log_conf.json \
+      #     "${CRAFT_PART_INSTALL}/opt/immich-machine-learning/log_conf.json"
+      # )
+
+    organize:
+      usr/lib/jellyfin-ffmpeg/lib/*:   usr/lib/
+      usr/lib/jellyfin-ffmpeg/share/*: usr/share/
+      usr/lib/jellyfin-ffmpeg/ffmpeg:  usr/bin/ffmpeg
+      usr/lib/jellyfin-ffmpeg/vainfo:  usr/bin/vainfo
+      usr/lib/jellyfin-ffmpeg/ffprobe: usr/bin/ffprobe
+    stage:
+      - -usr/lib/immich/cli/node_modules/@rollup/rollup-linux-x64-musl/rollup.linux-x64-musl.node
+
+  geonames:
+    plugin: nil
+    source: https://download.geonames.org/export/dump/cities500.zip
+    override-pull: |
+      craftctl default
+
+      mkdir -p "${CRAFT_PART_INSTALL}/usr/lib/immich/build/geodata"
+
+      curl -o "${CRAFT_PART_INSTALL}/usr/lib/immich/build/geodata/admin1CodesASCII.txt"             \
+        https://download.geonames.org/export/dump/admin1CodesASCII.txt
+      curl -o "${CRAFT_PART_INSTALL}/usr/lib/immich/build/geodata/admin2Codes.txt"                  \
+        https://download.geonames.org/export/dump/admin2Codes.txt
+      curl -o "${CRAFT_PART_INSTALL}/usr/lib/immich/build/geodata/ne_10m_admin_0_countries.geojson" \
+        https://raw.githubusercontent.com/nvkelso/natural-earth-vector/v5.1.2/geojson/ne_10m_admin_0_countries.geojson
+
+      cp -f "${CRAFT_PART_SRC}/"* "${CRAFT_PART_INSTALL}/usr/lib/immich/build/geodata"
+
+      date --iso-8601=seconds | tr -d "\n" > "${CRAFT_PART_INSTALL}/usr/lib/immich/build/geodata/geodata-date.txt"
